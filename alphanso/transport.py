@@ -2,9 +2,11 @@ import logging
 import numpy as np
 import math
 import os
+from concurrent.futures import ThreadPoolExecutor
 from scipy.interpolate import interp1d
 from scipy.special import erf
 from collections import defaultdict
+from numba import njit
 
 from .constants import AVOGADRO_NUM, ANEUT_MASS, ALPH_MASS
 from .atomic_data_loader import atomic_data
@@ -18,6 +20,30 @@ from .data_manager import ensure_data
 from .utils import rebin_xs, get_composite_stopping, matdef_to_zaids, rebin_endf_spectrum
 
 logger = logging.getLogger(__name__)
+
+
+@njit
+def _accumulate_spectrum(b_lo, b_hi, y_flat, w_flat, enmin_flat, enmax_flat):
+    nng = len(b_lo)
+    spectrum = np.zeros(nng)
+    for m in range(nng):
+        blo = b_lo[m]
+        bhi = b_hi[m]
+        ov_upper = np.minimum(bhi, enmax_flat)
+        ov_lower = np.maximum(blo, enmin_flat)
+        overlap = np.maximum(0.0, ov_upper - ov_lower)
+        spectrum[m] = np.sum(y_flat * overlap / w_flat)
+    return spectrum
+
+
+@njit
+def _build_range_table(energies, stops):
+    n = len(energies)
+    range_table = np.zeros(n)
+    for i in range(1, n):
+        de = energies[i] - energies[i - 1]
+        range_table[i] = range_table[i - 1] + 0.5 * (1.0 / stops[i - 1] + 1.0 / stops[i]) * de
+    return range_table
 
 
 def _reverse_spectrum_results(results: dict) -> dict:
@@ -411,15 +437,7 @@ class Transport(object):
         b_lo = np.minimum(bin_edges[:-1], bin_edges[1:])
         b_hi = np.maximum(bin_edges[:-1], bin_edges[1:])
 
-        for m in range(nng):
-            blo = b_lo[m]
-            bhi = b_hi[m]
-
-            ov_upper = np.minimum(bhi, enmax_flat)
-            ov_lower = np.maximum(blo, enmin_flat)
-            overlap = np.maximum(0.0, ov_upper - ov_lower)
-
-            spectrum[m] = np.sum(y_flat * overlap / w_flat)
+        spectrum = _accumulate_spectrum(b_lo, b_hi, y_flat, w_flat, enmin_flat, enmax_flat)
 
         if gamma_cascades is not None and gamma_energy_bins is not None:
             gamma_yield, gamma_lines, gamma_spectrum = Transport._calculate_gamma_spectrum(
@@ -662,89 +680,81 @@ class Transport(object):
                 'gamma_cascades': gamma_cascades
             })
 
-        for e_i_pair in energies:
-            e = e_i_pair[0]
-            i = e_i_pair[1]
+        def _worker(e, intensity, t_data):
+            min_xs_energy = min(t_data['energy_keys'])
+            if e < min_xs_energy:
+                return None
 
-            if i == 0:
-                continue
+            energy_keys = t_data['energy_keys']
+            alpha_energy_index = np.searchsorted(energy_keys, e, side='right') - 1
+            if alpha_energy_index < 0:
+                alpha_energy_index = 0
+            if alpha_energy_index >= len(energy_keys):
+                alpha_energy_index = len(energy_keys) - 1
 
-            for t_data in target_data_list:
-                min_xs_energy = min(t_data['energy_keys'])
-                if e < min_xs_energy:
+            closest_energy = energy_keys[alpha_energy_index]
+            f_branching = np.array(t_data['branching_data'][closest_energy])
+
+            valid_levels = []
+            valid_bf_columns = []
+            for level_idx, level_energy in enumerate(t_data['level_energies']):
+                q_eff = t_data['q_value'] - level_energy
+                if q_eff < 0:
+                    threshold = -q_eff * (ANEUT_MASS + t_data['product_mass']) / t_data['target_mass_amu']
+                else:
+                    threshold = 0
+                if e >= threshold and level_energy >= 0 and level_energy < 50:
+                    valid_levels.append(level_energy)
+                    valid_bf_columns.append(level_idx)
+
+            if not valid_levels:
+                return None
+
+            scale = t_data['afrac'] * intensity
+            p, spectrum, gamma_y, gamma_lines, gamma_spec = Transport._integrate_over_ebins(
+                e,
+                neutron_energy_bins,
+                t_data['an_xs_binned'],
+                stopping_binned,
+                t_data['branching_data'],
+                valid_levels,
+                t_data['q_value'],
+                t_data['product_mass'],
+                t_data['target_mass_amu'],
+                t_data['energy_keys'],
+                gamma_cascades=t_data['gamma_cascades'] if calculate_gammas else None,
+                gamma_energy_bins=gamma_energy_bins
+            )
+            return {
+                'p': p * scale,
+                'spectrum': spectrum * scale,
+                'gamma_y': gamma_y * scale,
+                'gamma_lines': [(eg, ig * scale) for eg, ig in gamma_lines],
+                'gamma_spec': gamma_spec * scale if gamma_spec is not None else None,
+            }
+
+        futures = []
+        with ThreadPoolExecutor() as pool:
+            for e_i_pair in energies:
+                e = e_i_pair[0]
+                intensity = e_i_pair[1]
+                if intensity == 0:
                     continue
+                for t_data in target_data_list:
+                    futures.append(pool.submit(_worker, e, intensity, t_data))
 
-                energy_keys = t_data['energy_keys']
-                alpha_energy_index = np.searchsorted(
-                    energy_keys, e, side='right') - 1
-                if alpha_energy_index < 0:
-                    alpha_energy_index = 0
-                if alpha_energy_index >= len(energy_keys):
-                    alpha_energy_index = len(energy_keys) - 1
-
-                closest_energy = energy_keys[alpha_energy_index]
-                f_branching = np.array(
-                    t_data['branching_data'][closest_energy])
-
-                valid_levels = []
-                valid_bf_columns = []
-
-                for level_idx, level_energy in enumerate(
-                        t_data['level_energies']):
-                    q_eff = t_data['q_value'] - level_energy
-                    if q_eff < 0:
-                        threshold = -q_eff * \
-                            (ANEUT_MASS + t_data['product_mass']) / t_data['target_mass_amu']
-                    else:
-                        threshold = 0
-
-                    if (e >= threshold and level_energy >=
-                            0 and level_energy < 50):
-                        valid_levels.append(level_energy)
-                        valid_bf_columns.append(level_idx)
-
-                if valid_levels:
-                    el_valid = valid_levels
-                    f_branching_valid = f_branching[valid_bf_columns]
-
-                    if calculate_gammas:
-                        p, spectrum, gamma_y, gamma_lines, gamma_spec = Transport._integrate_over_ebins(
-                            e,
-                            neutron_energy_bins,
-                            t_data['an_xs_binned'],
-                            stopping_binned,
-                            t_data['branching_data'],
-                            el_valid,
-                            t_data['q_value'],
-                            t_data['product_mass'],
-                            t_data['target_mass_amu'],
-                            t_data['energy_keys'],
-                            gamma_cascades=t_data['gamma_cascades'],
-                            gamma_energy_bins=gamma_energy_bins
-                        )
-                        total_spectrum += spectrum * t_data['afrac'] * i
-                        p_total += p * t_data['afrac'] * i
-
-                        total_gamma_yield += gamma_y * t_data['afrac'] * i
-                        if gamma_spec is not None:
-                            total_gamma_spectrum += gamma_spec * t_data['afrac'] * i
-                        for energy, intensity in gamma_lines:
-                            total_gamma_lines[energy] += intensity * t_data['afrac'] * i
-                    else:
-                        p, spectrum, _, _, _ = Transport._integrate_over_ebins(
-                            e,
-                            neutron_energy_bins,
-                            t_data['an_xs_binned'],
-                            stopping_binned,
-                            t_data['branching_data'],
-                            el_valid,
-                            t_data['q_value'],
-                            t_data['product_mass'],
-                            t_data['target_mass_amu'],
-                            t_data['energy_keys']
-                        )
-                        total_spectrum += spectrum * t_data['afrac'] * i
-                        p_total += p * t_data['afrac'] * i
+        for future in futures:
+            result = future.result()
+            if result is None:
+                continue
+            p_total += result['p']
+            total_spectrum += result['spectrum']
+            if calculate_gammas:
+                total_gamma_yield += result['gamma_y']
+                if result['gamma_spec'] is not None:
+                    total_gamma_spectrum += result['gamma_spec']
+                for eg, ig in result['gamma_lines']:
+                    total_gamma_lines[eg] += ig
 
         if np.sum(total_spectrum) > 0:
             normalized_spectrum = total_spectrum / np.sum(total_spectrum)
@@ -1151,11 +1161,8 @@ class Transport(object):
         e_bin_edges = energies
         e_bin_centers = 0.5 * (e_bin_edges[:-1] + e_bin_edges[1:])
 
-        integrals = []
-        for lo, hi in zip(e_bin_edges[:-1], e_bin_edges[1:]):
-            mask = (energies >= lo) & (energies <= hi)
-            integral = np.trapezoid(1.0 / stops[mask], energies[mask])
-            integrals.append(integral)
+        inv_stops = 1.0 / stops
+        integrals = 0.5 * (inv_stops[:-1] + inv_stops[1:]) * np.diff(e_bin_edges)
         stopping_integral = np.column_stack([e_bin_centers, integrals])
         return stopping_integral
 
@@ -1225,12 +1232,7 @@ class Transport(object):
         right_val = sp_v[-1]
         stops = np.interp(energies, sp_e, sp_v, left=left_val, right=right_val)
 
-        range_table = np.zeros_like(energies)
-        for i in range(1, len(energies)):
-            range_table[i] = range_table[i - 1] + np.trapezoid(
-                1.0 / stops[i - 1:i + 1],
-                energies[i - 1:i + 1]
-            )
+        range_table = _build_range_table(energies, stops)
 
         cos_theta = np.linspace(1.0, 0.01, n_angular_bins + 1)
         cos_theta_centers = 0.5 * (cos_theta[:-1] + cos_theta[1:])
@@ -1240,37 +1242,35 @@ class Transport(object):
 
         path_lengths = layer_thickness / cos_theta_centers
 
-        degraded_spectrum = {}
+        alpha_arr = np.array(alpha_energies)
+        e_in_arr = alpha_arr[:, 0]
+        intensity_arr = alpha_arr[:, 1]
+        valid_alpha = (e_in_arr > 0) & (intensity_arr > 0)
+        e_in_arr = e_in_arr[valid_alpha]
+        intensity_arr = intensity_arr[valid_alpha]
 
-        for e_in, intensity_in in alpha_energies:
-            if e_in <= 0 or intensity_in <= 0:
-                continue
+        if len(e_in_arr) == 0:
+            return []
 
-            range_in = np.interp(e_in, energies, range_table)
+        range_in_arr = np.interp(e_in_arr, energies, range_table)
+        range_out = range_in_arr[:, None] - path_lengths[None, :]
+        valid_mask = range_in_arr[:, None] >= path_lengths[None, :]
+        e_out_all = np.interp(range_out.ravel(), range_table, energies).reshape(range_out.shape)
+        valid_mask &= (e_out_all > 0) & (e_out_all < e_in_arr[:, None])
 
-            for i_ang in range(n_angular_bins):
-                if range_in < path_lengths[i_ang]:
-                    continue
+        e_out_valid = e_out_all[valid_mask]
+        intensity_out_valid = (intensity_arr[:, None] * d_omega_normalized[None, :])[valid_mask]
 
-                range_out = range_in - path_lengths[i_ang]
+        if len(e_out_valid) == 0:
+            return []
 
-                e_out = np.interp(range_out, range_table, energies)
+        e_out_binned = np.round(e_out_valid, 4)
+        unique_energies, inverse = np.unique(e_out_binned, return_inverse=True)
+        intensities = np.zeros(len(unique_energies))
+        np.add.at(intensities, inverse, intensity_out_valid)
 
-                if e_out <= 0 or e_out >= e_in:
-                    continue
-
-                intensity_out = intensity_in * d_omega_normalized[i_ang]
-
-                e_out_binned = round(e_out, 4)
-                if e_out_binned in degraded_spectrum:
-                    degraded_spectrum[e_out_binned] += intensity_out
-                else:
-                    degraded_spectrum[e_out_binned] = intensity_out
-
-        degraded_list = [(e, i) for e, i in degraded_spectrum.items() if i > 0]
-        degraded_list.sort(key=lambda x: x[0])
-
-        return degraded_list
+        keep = intensities > 0
+        return list(zip(unique_energies[keep].tolist(), intensities[keep].tolist()))
 
     @staticmethod
     def sandwich_alpha_term_bc(
@@ -1635,16 +1635,10 @@ class Transport(object):
                 result[ang, ig] = itrans2[ang, itrans1[ang, ig]]
         """
         n_angular_bins, num_alpha_groups = itrans1.shape
-        result = np.zeros_like(itrans1)
-
-        for i_ang in range(n_angular_bins):
-            for ig in range(num_alpha_groups):
-                intermediate_group = itrans1[i_ang, ig]
-                if intermediate_group >= num_alpha_groups:
-                    result[i_ang, ig] = num_alpha_groups - 1
-                else:
-                    result[i_ang, ig] = itrans2[i_ang, intermediate_group]
-
+        out_of_bounds = itrans1 >= num_alpha_groups
+        clamped = np.minimum(itrans1, num_alpha_groups - 1)
+        result = itrans2[np.arange(n_angular_bins)[:, np.newaxis], clamped]
+        result[out_of_bounds] = num_alpha_groups - 1
         return result
 
     @staticmethod

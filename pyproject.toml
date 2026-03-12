@@ -28,6 +28,7 @@ dependencies = [
     "scipy",
     "PyYAML>=6.0.2",
     "platformdirs>=3.0",
+    "numba>=0.60",
 ]
 
 [project.scripts]
