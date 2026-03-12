@@ -6,7 +6,7 @@ Thank you for your interest in contributing to ALPHANSO!
 
 ### Prerequisites
 
-- Python >= 3.8
+- Python >= 3.10
 - Dependencies: numpy, pandas, scipy, PyYAML
 
 ### Development Setup

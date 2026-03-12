@@ -2,7 +2,7 @@
 
 Open-source Python package for modeling ($\alpha$,n) neutron source terms.
 
-![Python >= 3.8](https://img.shields.io/badge/python-%3E%3D3.8-blue)
+![Python >= 3.10](https://img.shields.io/badge/python-%3E%3D3.10-blue)
 ![License: BSD-3-Clause](https://img.shields.io/badge/license-BSD--3--Clause-green)
 ![PyPI](https://img.shields.io/pypi/v/alphanso)
 

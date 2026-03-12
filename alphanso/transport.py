@@ -1154,7 +1154,7 @@ class Transport(object):
         integrals = []
         for lo, hi in zip(e_bin_edges[:-1], e_bin_edges[1:]):
             mask = (energies >= lo) & (energies <= hi)
-            integral = np.trapz(1.0 / stops[mask], energies[mask])
+            integral = np.trapezoid(1.0 / stops[mask], energies[mask])
             integrals.append(integral)
         stopping_integral = np.column_stack([e_bin_centers, integrals])
         return stopping_integral
@@ -1227,7 +1227,7 @@ class Transport(object):
 
         range_table = np.zeros_like(energies)
         for i in range(1, len(energies)):
-            range_table[i] = range_table[i - 1] + np.trapz(
+            range_table[i] = range_table[i - 1] + np.trapezoid(
                 1.0 / stops[i - 1:i + 1],
                 energies[i - 1:i + 1]
             )

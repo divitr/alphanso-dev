@@ -7,7 +7,7 @@ name = "alphanso"
 version = "1.0.0"
 description = "Alpha-neutron source calculation package"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = {text = "BSD-3-Clause"}
 authors = [
     {name = "Divit Rawal", email = "divit.rawal@berkeley.edu"},
@@ -23,7 +23,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Physics",
 ]
 dependencies = [
-    "numpy",
+    "numpy>=2.0",
     "pandas",
     "scipy",
     "PyYAML>=6.0.2",
