@@ -5,6 +5,7 @@ Open-source Python package for modeling ($\alpha$,n) neutron source terms.
 ![Python >= 3.10](https://img.shields.io/badge/python-%3E%3D3.10-blue)
 ![License: BSD-3-Clause](https://img.shields.io/badge/license-BSD--3--Clause-green)
 ![PyPI](https://img.shields.io/pypi/v/alphanso)
+[![arXiv](https://img.shields.io/badge/arXiv-2603.17719-b31b1b)](https://arxiv.org/abs/2603.17719)
 
 ## Motivation
 
@@ -205,8 +206,9 @@ Uniform mixture of alpha-emitting isotopes and target materials.
 **Results**:
 
 - `an_yield`: Alpha-n neutron yield (n/s/g)
-- `sf_yield`: Spontaneous fission neutron yield (n/s/g)
+- `sf_yield`: Spontaneous fission prompt neutron yield (n/s/g)
 - `combined_yield`: Combined (alpha-n + SF) yield (n/s/g) - default output
+- `delayedn_strength`: Delayed neutron yield from spontaneous fission (n/s/g); zero if no SF nuclides or no nu_d data available
 - `an_spectrum`: Normalized alpha-n neutron spectrum
 - `sf_spectrum`: Normalized spontaneous fission neutron spectrum
 - `combined_spectrum`: Combined normalized neutron spectrum
@@ -338,11 +340,13 @@ If you use ALPHANSO in your research, please cite:
 
 ```bibtex
 @article{rawal2026alphanso,
-  title     = {{ALPHANSO}: Open-Source Modeling of ($\alpha$,n) Neutron Source Terms},
-  author    = {Rawal, Divit and Nelson, Anthony J. and Zywiec, William and Siefman, Daniel},
-  journal   = {Nuclear Instruments and Methods in Physics Research Section A},
-  year      = {2026},
-  note      = {Preprint}
+  title          = {{ALPHANSO}: Open-Source Modeling of ($\alpha$,n) Neutron Source Terms},
+  author         = {Rawal, Divit and Nelson, Anthony J. and Zywiec, William and Siefman, Daniel},
+  journal        = {Nuclear Instruments and Methods in Physics Research Section A},
+  year           = {2026},
+  eprint         = {2603.17719},
+  archivePrefix  = {arXiv},
+  note           = {Preprint: \url{https://arxiv.org/abs/2603.17719}}
 }
 ```
 
