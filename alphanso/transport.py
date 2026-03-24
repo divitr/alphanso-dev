@@ -12,12 +12,19 @@ from .constants import AVOGADRO_NUM, ANEUT_MASS, ALPH_MASS
 from .atomic_data_loader import atomic_data
 from .parsers import (
     get_an_xs,
+    get_angular_distributions,
     get_branching_info,
     get_decay_spectrum,
     get_stopping_power,
     get_gamma_cascade_info)
 from .data_manager import ensure_data
-from .utils import rebin_xs, get_composite_stopping, matdef_to_zaids, rebin_endf_spectrum
+from .utils import (
+    rebin_xs,
+    get_composite_stopping,
+    matdef_to_zaids,
+    rebin_endf_spectrum,
+    _accumulate_spectrum_legendre,
+    _interpolate_legendre_coeffs)
 
 logger = logging.getLogger(__name__)
 
@@ -302,7 +309,9 @@ class Transport(object):
             target_mass_amu,
             ep_branching,
             gamma_cascades=None,
-            gamma_energy_bins=None):
+            gamma_energy_bins=None,
+            angular_dists=None,
+            level_indices=None):
         """
         Calculate neutron yield and energy spectrum from alpha slowing down in target.
 
@@ -319,6 +328,11 @@ class Transport(object):
             ep_branching: list - Alpha energy grid for branching ratio interpolation
             gamma_cascades: dict, optional - Gamma cascade data {level_idx: [(final, E_gamma, prob), ...]}
             gamma_energy_bins: ndarray, optional - Energy bins for gamma spectrum
+            angular_dists: dict, optional - Per-level Legendre angular distribution data
+                {level_idx: {alpha_energy_MeV: [a_0, a_1, ..., a_L]}}. If None or not
+                present for a given level, isotropic (uniform) emission is used.
+            level_indices: list, optional - Maps position j in energy_levels to the
+                original level index used as a key in angular_dists
 
         Returns:
             tuple - (an_yield: float, spectrum: ndarray, gamma_yield: float, gamma_lines: list, gamma_spectrum: ndarray)
@@ -437,7 +451,30 @@ class Transport(object):
         b_lo = np.minimum(bin_edges[:-1], bin_edges[1:])
         b_hi = np.maximum(bin_edges[:-1], bin_edges[1:])
 
-        spectrum = _accumulate_spectrum(b_lo, b_hi, y_flat, w_flat, enmin_flat, enmax_flat)
+        if angular_dists is not None and level_indices is not None:
+            valid_i, valid_j = np.where(valid_physics)
+            n_valid = len(valid_i)
+            coeff_list = []
+            max_n = 1
+            for k in range(n_valid):
+                c = _interpolate_legendre_coeffs(
+                    angular_dists.get(level_indices[int(valid_j[k])]),
+                    e_steps_valid[int(valid_i[k])])
+                if c is None:
+                    c = np.array([1.0])
+                coeff_list.append(c)
+                if len(c) > max_n:
+                    max_n = len(c)
+            coeffs_padded = np.zeros((n_valid, max_n))
+            for k, c in enumerate(coeff_list):
+                coeffs_padded[k, :len(c)] = c
+            spectrum = _accumulate_spectrum_legendre(
+                b_lo, b_hi,
+                valid_i.astype(np.int64),
+                valid_j.astype(np.int64),
+                yield_matrix, enmin, enmax, coeffs_padded)
+        else:
+            spectrum = _accumulate_spectrum(b_lo, b_hi, y_flat, w_flat, enmin_flat, enmax_flat)
 
         if gamma_cascades is not None and gamma_energy_bins is not None:
             gamma_yield, gamma_lines, gamma_spectrum = Transport._calculate_gamma_spectrum(
@@ -667,6 +704,8 @@ class Transport(object):
                     level_energies=level_energies
                 )
 
+            angular_dists = get_angular_distributions(zaid, an_xs_data_source)
+
             target_data_list.append({
                 'zaid': zaid,
                 'afrac': afrac,
@@ -677,7 +716,8 @@ class Transport(object):
                 'level_energies': level_energies,
                 'branching_data': branching_data,
                 'energy_keys': sorted(branching_data.keys()),
-                'gamma_cascades': gamma_cascades
+                'gamma_cascades': gamma_cascades,
+                'angular_dists': angular_dists
             })
 
         def _worker(e, intensity, t_data):
@@ -723,7 +763,9 @@ class Transport(object):
                 t_data['target_mass_amu'],
                 t_data['energy_keys'],
                 gamma_cascades=t_data['gamma_cascades'] if calculate_gammas else None,
-                gamma_energy_bins=gamma_energy_bins
+                gamma_energy_bins=gamma_energy_bins,
+                angular_dists=t_data.get('angular_dists'),
+                level_indices=valid_bf_columns
             )
             return {
                 'p': p * scale,

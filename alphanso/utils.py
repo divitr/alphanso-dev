@@ -3,8 +3,9 @@ Miscellaneous utility functions for ALPHANSO.
 """
 
 import numpy as np
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 from scipy.interpolate import interp1d
+from numba import njit
 
 from .parsers import get_stopping_power
 from .atomic_data_loader import (
@@ -213,3 +214,117 @@ def rebin_endf_spectrum(
         spectrum = spectrum / total
 
     return spectrum
+
+
+@njit
+def _legendre_antideriv(coeffs, mu):
+    """
+    Evaluate the antiderivative of the Legendre angular distribution at mu.
+
+    Computes F(mu) = (1/2) * sum_l a_l * (P_{l+1}(mu) - P_{l-1}(mu)), where P_{-1} = 1,
+    using the three-term recurrence for Legendre polynomials. The integral of the
+    distribution from mu1 to mu2 is F(mu2) - F(mu1).
+
+    Args:
+        coeffs: ndarray - Legendre coefficients [a_0, a_1, ..., a_L] with a_0 = 1
+        mu: float - Evaluation point
+
+    Returns:
+        float - Antiderivative value at mu
+    """
+    p_prev = 1.0
+    p_curr = 1.0
+    p_next = mu
+    result = 0.5 * coeffs[0] * (p_next - p_prev)
+    for l in range(1, len(coeffs)):
+        p_new = ((2 * l + 1) * mu * p_next - l * p_curr) / (l + 1)
+        result += 0.5 * coeffs[l] * (p_new - p_curr)
+        p_prev = p_curr
+        p_curr = p_next
+        p_next = p_new
+    return result
+
+
+@njit
+def _accumulate_spectrum_legendre(b_lo, b_hi, valid_i, valid_j, yield_matrix, enmin, enmax, coeffs_padded):
+    """
+    Accumulate neutron spectrum using Legendre angular distribution weighting.
+
+    For each valid (alpha_step, level) pair, distributes the yield into energy bins
+    using the analytic integral of the Legendre-expanded CM-frame angular distribution,
+    mapped to lab-frame energy via E_n = mid + half_w * cos(theta_CM).
+
+    Args:
+        b_lo: ndarray - Lower edges of neutron energy bins
+        b_hi: ndarray - Upper edges of neutron energy bins
+        valid_i: ndarray - Alpha step indices of valid (step, level) pairs
+        valid_j: ndarray - Level indices of valid (step, level) pairs
+        yield_matrix: ndarray - Yield weights, shape (n_steps, n_levels)
+        enmin: ndarray - Minimum lab neutron energy, shape (n_steps, n_levels)
+        enmax: ndarray - Maximum lab neutron energy, shape (n_steps, n_levels)
+        coeffs_padded: ndarray - Legendre coefficients, shape (n_valid, max_L+1),
+            padded with zeros. Use [1, 0, 0, ...] for isotropic fallback.
+
+    Returns:
+        ndarray - Accumulated spectrum, shape (len(b_lo),)
+    """
+    nng = len(b_lo)
+    n_valid = len(valid_i)
+    spectrum = np.zeros(nng)
+    for k in range(n_valid):
+        i = valid_i[k]
+        j = valid_j[k]
+        enmin_k = enmin[i, j]
+        enmax_k = enmax[i, j]
+        y_k = yield_matrix[i, j]
+        half_w = (enmax_k - enmin_k) * 0.5
+        mid = (enmax_k + enmin_k) * 0.5
+        c = coeffs_padded[k]
+        for m in range(nng):
+            e_lo = max(b_lo[m], enmin_k)
+            e_hi = min(b_hi[m], enmax_k)
+            if e_hi <= e_lo:
+                continue
+            mu1 = (e_lo - mid) / half_w
+            mu2 = (e_hi - mid) / half_w
+            spectrum[m] += y_k * (_legendre_antideriv(c, mu2) - _legendre_antideriv(c, mu1))
+    return spectrum
+
+
+def _interpolate_legendre_coeffs(
+        ang_dist: Optional[Dict[float, List[float]]],
+        e_alpha_mev: float) -> Optional[np.ndarray]:
+    """
+    Linearly interpolate Legendre angular distribution coefficients at a given alpha energy.
+
+    Args:
+        ang_dist: dict, optional - {alpha_energy_MeV: [a_0, a_1, ..., a_L]}
+        e_alpha_mev: float - Alpha particle energy in MeV
+
+    Returns:
+        ndarray, optional - Interpolated Legendre coefficients, or None if outside
+        the tabulated energy range or if ang_dist is None
+    """
+    if ang_dist is None:
+        return None
+
+    energies = sorted(ang_dist.keys())
+    if not energies or e_alpha_mev < energies[0] or e_alpha_mev > energies[-1]:
+        return None
+
+    idx = int(np.searchsorted(energies, e_alpha_mev, side='right')) - 1
+    idx = min(idx, len(energies) - 2)
+
+    e_lo = energies[idx]
+    e_hi = energies[idx + 1]
+    c_lo = ang_dist[e_lo]
+    c_hi = ang_dist[e_hi]
+
+    max_len = max(len(c_lo), len(c_hi))
+    arr_lo = np.zeros(max_len)
+    arr_hi = np.zeros(max_len)
+    arr_lo[:len(c_lo)] = c_lo
+    arr_hi[:len(c_hi)] = c_hi
+
+    t = (e_alpha_mev - e_lo) / (e_hi - e_lo) if e_hi > e_lo else 0.0
+    return arr_lo + t * (arr_hi - arr_lo)
