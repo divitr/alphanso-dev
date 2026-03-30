@@ -11,11 +11,19 @@ from .atomic_data_loader import atomic_data
 from .parsers import (
     get_an_xs,
     get_branching_info,
+    get_continuum_info,
     get_decay_spectrum,
     get_stopping_power,
     get_gamma_cascade_info)
 from .data_manager import ensure_data
-from .utils import rebin_xs, get_composite_stopping, matdef_to_zaids, rebin_endf_spectrum
+from .utils import (
+    rebin_xs,
+    get_composite_stopping,
+    matdef_to_zaids,
+    rebin_endf_spectrum,
+    _accumulate_spectrum_continuum_box,
+    _preprocess_continuum_dist,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -276,7 +284,9 @@ class Transport(object):
             target_mass_amu,
             ep_branching,
             gamma_cascades=None,
-            gamma_energy_bins=None):
+            gamma_energy_bins=None,
+            continuum_xs=None,
+            continuum_dist=None):
         """
         Calculate neutron yield and energy spectrum from alpha slowing down in target.
 
@@ -293,9 +303,15 @@ class Transport(object):
             ep_branching: list - Alpha energy grid for branching ratio interpolation
             gamma_cascades: dict, optional - Gamma cascade data {level_idx: [(final, E_gamma, prob), ...]}
             gamma_energy_bins: ndarray, optional - Energy bins for gamma spectrum
+            continuum_xs: dict, optional - MT=91 continuum cross sections
+                {energy_MeV: cross_section_barns}. If None, no continuum channel is added.
+            continuum_dist: dict, optional - MT=91 neutron energy distribution
+                {incident_energy_MeV: [(E_out_MeV, prob_1/MeV), ...]}. If None and
+                continuum_xs is not None, falls back to a kinematic box over [0, enmax_91].
 
         Returns:
             tuple - (an_yield: float, spectrum: ndarray, gamma_yield: float, gamma_lines: list, gamma_spectrum: ndarray)
+            an_yield includes both discrete and continuum contributions.
         """
 
         nng = len(neutron_energy_bins) - 1
@@ -396,6 +412,18 @@ class Transport(object):
         yield_matrix = prob_steps[:, np.newaxis] * \
             br_matrix * de_valid[:, np.newaxis]
 
+        cont_yield_steps = None
+        if continuum_xs is not None:
+            cont_xs_e = np.array(sorted(continuum_xs.keys()))
+            cont_xs_v = np.array([continuum_xs[e] for e in cont_xs_e])
+            sigma91_cm2 = np.interp(
+                e_steps_valid, cont_xs_e, cont_xs_v, left=0.0, right=0.0) * 1e-24
+            sigma_total_cm2 = cs_cm2_grid[valid_mask]
+            f_91 = np.minimum(sigma91_cm2 / sigma_total_cm2, 1.0)
+            if np.any(f_91 > 0.0):
+                yield_matrix = yield_matrix * (1.0 - f_91[:, np.newaxis])
+                cont_yield_steps = prob_steps * de_valid * f_91
+
         width_matrix = enmax - enmin
         width_matrix[width_matrix <= 0] = 1e-30
 
@@ -420,6 +448,17 @@ class Transport(object):
             overlap = np.maximum(0.0, ov_upper - ov_lower)
 
             spectrum[m] = np.sum(y_flat * overlap / w_flat)
+
+        if cont_yield_steps is not None:
+            if continuum_dist is not None:
+                f_matrix = _preprocess_continuum_dist(
+                    continuum_dist, e_steps_valid, neutron_energy_bins)
+                spectrum = spectrum + np.einsum('i,ij->j', cont_yield_steps, f_matrix)
+            else:
+                spectrum = spectrum + _accumulate_spectrum_continuum_box(
+                    b_lo, b_hi, cont_yield_steps, e_steps_valid,
+                    q_value, product_mass, target_mass_amu,
+                    ANEUT_MASS, ALPH_MASS)
 
         if gamma_cascades is not None and gamma_energy_bins is not None:
             gamma_yield, gamma_lines, gamma_spectrum = Transport._calculate_gamma_spectrum(
@@ -649,6 +688,9 @@ class Transport(object):
                     level_energies=level_energies
                 )
 
+            continuum_xs_data, continuum_dist_data = get_continuum_info(
+                zaid, an_xs_data_source)
+
             target_data_list.append({
                 'zaid': zaid,
                 'afrac': afrac,
@@ -659,7 +701,9 @@ class Transport(object):
                 'level_energies': level_energies,
                 'branching_data': branching_data,
                 'energy_keys': sorted(branching_data.keys()),
-                'gamma_cascades': gamma_cascades
+                'gamma_cascades': gamma_cascades,
+                'continuum_xs': continuum_xs_data,
+                'continuum_dist': continuum_dist_data,
             })
 
         for e_i_pair in energies:
@@ -720,7 +764,9 @@ class Transport(object):
                             t_data['target_mass_amu'],
                             t_data['energy_keys'],
                             gamma_cascades=t_data['gamma_cascades'],
-                            gamma_energy_bins=gamma_energy_bins
+                            gamma_energy_bins=gamma_energy_bins,
+                            continuum_xs=t_data.get('continuum_xs'),
+                            continuum_dist=t_data.get('continuum_dist'),
                         )
                         total_spectrum += spectrum * t_data['afrac'] * i
                         p_total += p * t_data['afrac'] * i
@@ -741,7 +787,9 @@ class Transport(object):
                             t_data['q_value'],
                             t_data['product_mass'],
                             t_data['target_mass_amu'],
-                            t_data['energy_keys']
+                            t_data['energy_keys'],
+                            continuum_xs=t_data.get('continuum_xs'),
+                            continuum_dist=t_data.get('continuum_dist'),
                         )
                         total_spectrum += spectrum * t_data['afrac'] * i
                         p_total += p * t_data['afrac'] * i
