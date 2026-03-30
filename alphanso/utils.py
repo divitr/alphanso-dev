@@ -2,6 +2,7 @@
 Miscellaneous utility functions for ALPHANSO.
 """
 
+import math
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from scipy.interpolate import interp1d
@@ -328,3 +329,146 @@ def _interpolate_legendre_coeffs(
 
     t = (e_alpha_mev - e_lo) / (e_hi - e_lo) if e_hi > e_lo else 0.0
     return arr_lo + t * (arr_hi - arr_lo)
+
+
+def _preprocess_continuum_dist(
+        continuum_dist: Optional[Dict[float, List[Tuple[float, float]]]],
+        e_steps_mev: np.ndarray,
+        neutron_bins: np.ndarray) -> np.ndarray:
+    """
+    Pre-process a tabulated continuum energy distribution onto the output energy bin grid.
+
+    For each incident alpha energy step, bi-linearly interpolates f(E_out | E_alpha)
+    between the two bracketing tabulated incident energies and integrates over each
+    output energy bin using the trapezoidal rule.
+
+    Args:
+        continuum_dist: {incident_energy_MeV: [(E_out_MeV, prob_1/MeV), ...]}, or None
+        e_steps_mev: ndarray - Incident alpha energies at each integration step (MeV)
+        neutron_bins: ndarray - Neutron output energy bin edges (MeV)
+
+    Returns:
+        ndarray - Shape (n_steps, n_bins). Each row gives the fraction of continuum
+        yield deposited in each output bin. Rows sum to <= 1.
+    """
+    n_steps = len(e_steps_mev)
+    n_bins = len(neutron_bins) - 1
+    f_matrix = np.zeros((n_steps, n_bins))
+
+    if continuum_dist is None or len(continuum_dist) == 0:
+        return f_matrix
+
+    inc_energies = sorted(continuum_dist.keys())
+    e_min_tab = inc_energies[0]
+    e_max_tab = inc_energies[-1]
+
+    b_lo = np.minimum(neutron_bins[:-1], neutron_bins[1:])
+    b_hi = np.maximum(neutron_bins[:-1], neutron_bins[1:])
+
+    for i in range(n_steps):
+        e_alpha = e_steps_mev[i]
+        if e_alpha < e_min_tab:
+            continue
+
+        idx = int(np.searchsorted(inc_energies, e_alpha, side='right')) - 1
+        idx = min(idx, len(inc_energies) - 2)
+
+        e_lo = inc_energies[idx]
+        e_hi_tab = inc_energies[idx + 1]
+        pairs_lo = continuum_dist[e_lo]
+        pairs_hi = continuum_dist[e_hi_tab]
+
+        eo_lo = np.array([p[0] for p in pairs_lo])
+        fp_lo = np.array([p[1] for p in pairs_lo])
+        eo_hi = np.array([p[0] for p in pairs_hi])
+        fp_hi = np.array([p[1] for p in pairs_hi])
+
+        merged_e = np.unique(np.concatenate([eo_lo, eo_hi]))
+        f_lo_interp = np.interp(merged_e, eo_lo, fp_lo, left=0.0, right=0.0)
+        f_hi_interp = np.interp(merged_e, eo_hi, fp_hi, left=0.0, right=0.0)
+
+        t = (e_alpha - e_lo) / (e_hi_tab - e_lo) if e_hi_tab > e_lo else 0.0
+        t = max(0.0, min(t, 1.0))
+        f_blend = f_lo_interp + t * (f_hi_interp - f_lo_interp)
+
+        for m in range(n_bins):
+            e1 = b_lo[m]
+            e2 = b_hi[m]
+            if e2 <= e1:
+                continue
+            inside = merged_e[(merged_e > e1) & (merged_e < e2)]
+            pts = np.concatenate([[e1], inside, [e2]])
+            vals = np.interp(pts, merged_e, f_blend, left=0.0, right=0.0)
+            integral = float(np.trapezoid(vals, pts))
+            if integral > 0.0:
+                f_matrix[i, m] = integral
+
+        row_sum = f_matrix[i].sum()
+        if row_sum > 0.0:
+            f_matrix[i] /= row_sum
+
+    return f_matrix
+
+
+@njit
+def _accumulate_spectrum_continuum_box(
+        b_lo, b_hi, cont_yield, e_steps,
+        q_value, product_mass, target_mass_amu,
+        aneut_mass, alph_mass):
+    """
+    Accumulate continuum channel spectrum using a kinematic box fallback.
+
+    Used when no tabulated neutron energy distribution is available for MT=91.
+    Distributes each alpha step's yield uniformly over [0, enmax_91] computed
+    from the same two-body kinematic formula as discrete levels with level_energy=0.
+
+    Args:
+        b_lo: ndarray - Lower edges of neutron energy bins (MeV)
+        b_hi: ndarray - Upper edges of neutron energy bins (MeV)
+        cont_yield: ndarray - Continuum yield integrand at each alpha step
+        e_steps: ndarray - Alpha energies at each step (MeV)
+        q_value: float - Ground-state Q-value used as continuum Q approximation (MeV)
+        product_mass: float - Product nucleus mass (amu)
+        target_mass_amu: float - Target nucleus mass (amu)
+        aneut_mass: float - Neutron mass (amu)
+        alph_mass: float - Alpha particle mass (amu)
+
+    Returns:
+        ndarray - Accumulated spectrum, shape (len(b_lo),)
+    """
+    nng = len(b_lo)
+    n_steps = len(e_steps)
+    spectrum = np.zeros(nng)
+
+    for i in range(n_steps):
+        e_alpha = e_steps[i]
+        y = cont_yield[i]
+        if y <= 0.0:
+            continue
+
+        term1 = math.sqrt(alph_mass * aneut_mass * e_alpha) / (aneut_mass + product_mass)
+        term2 = (alph_mass * aneut_mass * e_alpha) / ((aneut_mass + product_mass) ** 2)
+        term3 = (product_mass * e_alpha + product_mass * q_value -
+                 alph_mass * e_alpha) / (aneut_mass + product_mass)
+        sqrt_arg = term2 + term3
+        if sqrt_arg < 0.0:
+            continue
+
+        sqrt_val = math.sqrt(sqrt_arg)
+        enmax = (term1 + sqrt_val) ** 2
+        enmin = 0.0
+
+        if enmax <= enmin:
+            continue
+
+        width = enmax - enmin
+        density = y / width
+
+        for m in range(nng):
+            e_lo = b_lo[m] if b_lo[m] > enmin else enmin
+            e_hi = b_hi[m] if b_hi[m] < enmax else enmax
+            if e_hi <= e_lo:
+                continue
+            spectrum[m] += density * (e_hi - e_lo)
+
+    return spectrum
