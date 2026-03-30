@@ -6,8 +6,6 @@ from concurrent.futures import ThreadPoolExecutor
 from scipy.interpolate import interp1d
 from scipy.special import erf
 from collections import defaultdict
-from numba import njit
-
 from .constants import AVOGADRO_NUM, ANEUT_MASS, ALPH_MASS
 from .atomic_data_loader import atomic_data
 from .parsers import (
@@ -23,27 +21,19 @@ from .utils import rebin_xs, get_composite_stopping, matdef_to_zaids, rebin_endf
 logger = logging.getLogger(__name__)
 
 
-@njit
 def _accumulate_spectrum(b_lo, b_hi, y_flat, w_flat, enmin_flat, enmax_flat):
-    nng = len(b_lo)
-    spectrum = np.zeros(nng)
-    for m in range(nng):
-        blo = b_lo[m]
-        bhi = b_hi[m]
-        ov_upper = np.minimum(bhi, enmax_flat)
-        ov_lower = np.maximum(blo, enmin_flat)
-        overlap = np.maximum(0.0, ov_upper - ov_lower)
-        spectrum[m] = np.sum(y_flat * overlap / w_flat)
-    return spectrum
+    ov_upper = np.minimum(b_hi[:, None], enmax_flat[None, :])
+    ov_lower = np.maximum(b_lo[:, None], enmin_flat[None, :])
+    overlap = np.maximum(0.0, ov_upper - ov_lower)
+    return np.sum((y_flat / w_flat)[None, :] * overlap, axis=1)
 
 
-@njit
 def _build_range_table(energies, stops):
-    n = len(energies)
-    range_table = np.zeros(n)
-    for i in range(1, n):
-        de = energies[i] - energies[i - 1]
-        range_table[i] = range_table[i - 1] + 0.5 * (1.0 / stops[i - 1] + 1.0 / stops[i]) * de
+    de = np.diff(energies)
+    increments = 0.5 * (1.0 / stops[:-1] + 1.0 / stops[1:]) * de
+    range_table = np.empty(len(energies))
+    range_table[0] = 0.0
+    np.cumsum(increments, out=range_table[1:])
     return range_table
 
 
