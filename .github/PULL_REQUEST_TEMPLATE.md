@@ -15,4 +15,4 @@ Briefly describe what this PR does and why.
 - [ ] Tests pass locally (`pytest`)
 - [ ] New tests added (if applicable)
 - [ ] Documentation updated (if applicable)
-- [ ] PR targets the `main` branch
+- [ ] PR targets the correct branch (e.g. `develop` or `main`)
