@@ -94,6 +94,54 @@ def _get_endf_filename(zaid: int) -> str:
     return f"a-{z:03d}_{symbol}_{a:03d}.endf.gnds.xml"
 
 
+def _find_gnds_xml(zaid: int, data_dir: Optional[os.PathLike]) -> Optional[str]:
+    """Return the path to the GNDS XML file for zaid, or None if not found.
+
+    Handles default ENDF/JENDL/TENDL directory layouts and TENDL filename variants.
+
+    Args:
+        zaid: ZAID in ZZZAAA format
+        data_dir: Directory to search. None uses the default ENDF/JENDL/TENDL hierarchy.
+
+    Returns:
+        Absolute path to the first matching file, or None.
+    """
+    z = zaid // 1000
+    a = zaid % 1000
+    symbol = atomic_data.get_element_symbol(z)
+
+    if data_dir is None:
+        data_root = _default_data_root()
+        candidates = [
+            os.path.join(data_root, 'an_xs', "ENDF", _get_endf_filename(zaid)),
+            os.path.join(data_root, 'an_xs', "JENDL", f'{zaid}.xml'),
+            os.path.join(data_root, 'an_xs', "TENDL", f'{zaid}.xml'),
+        ]
+    else:
+        try:
+            data_dir_str = str(data_dir).lower()
+        except (TypeError, AttributeError):
+            data_dir_str = str(data_dir)
+        if "tendl-" in data_dir_str or "tendl" in data_dir_str:
+            candidates = [
+                os.path.join(data_dir, f"a-{symbol}{a:03d}.tendl.gnds.xml"),
+                os.path.join(data_dir, f"a_{z:03d}-{symbol}-{a:03d}.xml"),
+                os.path.join(data_dir, f"{symbol.upper()}{a:03d}.xml"),
+                os.path.join(data_dir, f"{symbol.capitalize()}{a:03d}.xml"),
+                os.path.join(data_dir, f"{symbol}{a:03d}.xml"),
+                os.path.join(data_dir, f"{zaid}.xml"),
+            ]
+        elif "endf" in data_dir_str:
+            candidates = [os.path.join(data_dir, _get_endf_filename(zaid))]
+        else:
+            candidates = [os.path.join(data_dir, f'{zaid}.xml')]
+
+    for cand in candidates:
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
 def get_an_xs(
         zaid: int, data_dir: Optional[os.PathLike] = None) -> Optional[Dict[float, float]]:
     """
@@ -130,70 +178,37 @@ def get_an_xs(
             data_dir)):
         return get_sources_an_xs(z, a, symbol, data_dir)
 
-    if data_dir is None:
-        data_root = _default_data_root()
-        endf_filename = _get_endf_filename(zaid)
-        endf_path = os.path.join(
-            data_root, "an_xs", "ENDF", endf_filename)
-        if os.path.exists(endf_path):
-            return _get_an_xs_xml(endf_path)
-        else:
-            jendl_filename = f"{zaid}.xml"
-            jendl_path = os.path.join(
-                data_root, "an_xs", "JENDL", jendl_filename)
-            if os.path.exists(jendl_path):
-                return _get_an_xs_xml(jendl_path)
-            else:
-                tendl_path = os.path.join(
-                    data_root, "an_xs", "TENDL", jendl_filename)
-                if os.path.exists(tendl_path):
-                    return _get_an_xs_xml(tendl_path)
-                else:
-                    return None
-    else:
-        filename = f"{zaid}.xml"
+    found_path = _find_gnds_xml(zaid, data_dir)
+
+    if found_path is None and data_dir is not None:
+        # TENDL directories may use non-standard filenames; fall back to a directory scan.
         try:
             data_dir_str = str(data_dir).lower()
         except (TypeError, AttributeError):
             data_dir_str = str(data_dir)
-
-        candidate_paths = []
-        if data_dir is not None and (
-                "tendl-" in data_dir_str or "tendl" in data_dir_str):
-            candidate_paths.extend([
-                os.path.join(data_dir, f"a-{symbol}{a:03d}.tendl.gnds.xml"),
-                os.path.join(data_dir, f"a_{z:03d}-{symbol}-{a:03d}.xml"),
-                os.path.join(data_dir, f"{symbol.upper()}{a:03d}.xml"),
-                os.path.join(data_dir, f"{symbol.capitalize()}{a:03d}.xml"),
-                os.path.join(data_dir, f"{symbol}{a:03d}.xml"),
-                os.path.join(data_dir, filename),
-            ])
-
-            for cand in candidate_paths:
-                if os.path.exists(cand):
-                    return _get_an_xs_xml(cand)
-
+        if "tendl-" in data_dir_str or "tendl" in data_dir_str:
             try:
                 for fname in os.listdir(data_dir):
                     if not fname.lower().endswith('.xml'):
                         continue
                     if symbol.lower() in fname.lower() and f"{a:03d}" in fname:
-                        cand = os.path.join(data_dir, fname)
-                        return _get_an_xs_xml(cand)
+                        found_path = os.path.join(data_dir, fname)
+                        break
             except OSError:
                 pass
 
-            return None
-        elif data_dir is not None and "endf" in data_dir_str:
-            endf_filename = _get_endf_filename(zaid)
-            endf_path = os.path.join(data_dir, endf_filename)
-            if os.path.exists(endf_path):
-                return _get_an_xs_xml(endf_path)
-            else:
-                return None
-        else:
-            filename = f"{zaid}.xml"
-            return _get_an_xs_xml(os.path.join(data_dir, filename))
+    if found_path is None:
+        if data_dir is not None:
+            try:
+                data_dir_str = str(data_dir).lower()
+            except (TypeError, AttributeError):
+                data_dir_str = str(data_dir)
+            if "tendl-" not in data_dir_str and "tendl" not in data_dir_str and "endf" not in data_dir_str:
+                # Plain data_dir: attempt parse directly (may raise if missing).
+                return _get_an_xs_xml(os.path.join(data_dir, f"{zaid}.xml"))
+        return None
+
+    return _get_an_xs_xml(found_path)
 
 
 def get_stopping_power(
@@ -295,45 +310,12 @@ def get_branching_info(zaid: int,
             data_dir is not None and "sources" in str(data_dir)):
         s4c_key = f"{z:04d}{a*10:04d}"
         return get_sources_branching_info(s4c_key, data_dir)
-    if data_dir is None:
-        data_root = _default_data_root()
-        possible_filepaths = [
-            os.path.join(data_root, 'an_xs',
-                         "ENDF", _get_endf_filename(zaid)),
-            os.path.join(data_root,
-                         'an_xs', "JENDL", f'{zaid}.xml'),
-            os.path.join(data_root,
-                         'an_xs', "TENDL", f'{zaid}.xml'),
-        ]
-    else:
-        try:
-            data_dir_str = str(data_dir).lower()
-        except (TypeError, AttributeError):
-            data_dir_str = str(data_dir)
-        if data_dir is not None and (
-                "tendl-" in data_dir_str or "tendl" in data_dir_str):
-            possible_filepaths = [
-                os.path.join(data_dir, f"a-{symbol}{a:03d}.tendl.gnds.xml"),
-                os.path.join(data_dir, f"a_{z:03d}-{symbol}-{a:03d}.xml"),
-                os.path.join(data_dir, f"{symbol.upper()}{a:03d}.xml"),
-                os.path.join(data_dir, f"{symbol.capitalize()}{a:03d}.xml"),
-                os.path.join(data_dir, f"{symbol}{a:03d}.xml"),
-                os.path.join(data_dir, f"{zaid}.xml"),
-            ]
-        else:
-            possible_filepaths = [
-                os.path.join(data_dir, f'{zaid}.xml')
-            ]
 
-    found_path = None
-    for cand_path in possible_filepaths:
-        if os.path.exists(cand_path):
-            found_path = cand_path
-            break
+    found_path = _find_gnds_xml(zaid, data_dir)
 
     if not found_path:
         logger.warning(
-            f"(a,n) cross sections file not found for {zaid} in {possible_filepaths}, cannot compute branching fractions.")
+            f"(a,n) cross sections file not found for {zaid}, cannot compute branching fractions.")
         return {}, {}, 0.0
 
     tree = ET.parse(found_path)
@@ -1835,10 +1817,6 @@ def get_continuum_info(
     if zaid >= 1e6:
         raise ValueError(f"ZAID {zaid} is not a valid ZZZAAA formatted ZAID.")
 
-    z = zaid // 1000
-    a = zaid % 1000
-    symbol = atomic_data.get_element_symbol(z)
-
     if data_dir is None and _should_use_sources_for_an_xs(zaid):
         return None, None
 
@@ -1846,37 +1824,7 @@ def get_continuum_info(
             data_dir is not None and "sources" in str(data_dir)):
         return None, None
 
-    if data_dir is None:
-        data_root = _default_data_root()
-        possible_filepaths = [
-            os.path.join(data_root, 'an_xs', "ENDF", _get_endf_filename(zaid)),
-            os.path.join(data_root, 'an_xs', "JENDL", f'{zaid}.xml'),
-            os.path.join(data_root, 'an_xs', "TENDL", f'{zaid}.xml'),
-        ]
-    else:
-        try:
-            data_dir_str = str(data_dir).lower()
-        except (TypeError, AttributeError):
-            data_dir_str = str(data_dir)
-        if "tendl-" in data_dir_str or "tendl" in data_dir_str:
-            possible_filepaths = [
-                os.path.join(data_dir, f"a-{symbol}{a:03d}.tendl.gnds.xml"),
-                os.path.join(data_dir, f"a_{z:03d}-{symbol}-{a:03d}.xml"),
-                os.path.join(data_dir, f"{symbol.upper()}{a:03d}.xml"),
-                os.path.join(data_dir, f"{symbol.capitalize()}{a:03d}.xml"),
-                os.path.join(data_dir, f"{symbol}{a:03d}.xml"),
-                os.path.join(data_dir, f"{zaid}.xml"),
-            ]
-        else:
-            possible_filepaths = [
-                os.path.join(data_dir, f'{zaid}.xml')
-            ]
-
-    found_path = None
-    for cand_path in possible_filepaths:
-        if os.path.exists(cand_path):
-            found_path = cand_path
-            break
+    found_path = _find_gnds_xml(zaid, data_dir)
 
     if not found_path:
         return None, None

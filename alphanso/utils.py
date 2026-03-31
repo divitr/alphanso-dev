@@ -2,7 +2,6 @@
 Miscellaneous utility functions for ALPHANSO.
 """
 
-import math
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from scipy.interpolate import interp1d
@@ -275,17 +274,17 @@ def _preprocess_continuum_dist(
         t = max(0.0, min(t, 1.0))
         f_blend = f_lo_interp + t * (f_hi_interp - f_lo_interp)
 
-        for m in range(n_bins):
-            e1 = b_lo[m]
-            e2 = b_hi[m]
-            if e2 <= e1:
-                continue
-            inside = merged_e[(merged_e > e1) & (merged_e < e2)]
-            pts = np.concatenate([[e1], inside, [e2]])
-            vals = np.interp(pts, merged_e, f_blend, left=0.0, right=0.0)
-            integral = float(np.trapezoid(vals, pts))
-            if integral > 0.0:
-                f_matrix[i, m] = integral
+        # Build CDF of f_blend over merged_e, then vectorize bin integration.
+        cdf = np.zeros(len(merged_e))
+        cdf[1:] = np.cumsum(
+            0.5 * (f_blend[:-1] + f_blend[1:]) * np.diff(merged_e)
+        )
+        cdf_lo = np.interp(b_lo, merged_e, cdf, left=0.0, right=cdf[-1])
+        cdf_hi = np.interp(b_hi, merged_e, cdf, left=0.0, right=cdf[-1])
+        bin_integrals = np.maximum(0.0, cdf_hi - cdf_lo)
+
+        valid_bins = b_hi > b_lo
+        f_matrix[i, valid_bins] = bin_integrals[valid_bins]
 
         row_sum = f_matrix[i].sum()
         if row_sum > 0.0:

@@ -15,10 +15,12 @@ import os
 import sys
 import yaml
 import numpy as np
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Union, Any
 from collections import defaultdict
 
+from .output_files import write_results_yaml
 from .transport import Transport
 from .data_manager import ensure_data, get_data_info
 
@@ -151,35 +153,79 @@ def read_out(configs: List[Dict[str, Any]],
         source_dir.mkdir(exist_ok=True)
 
         if len(config_list) == 1:
-            output_file = source_dir / "output.yaml"
-            with open(output_file, 'w') as f:
-                yaml.dump(config_list[0], f, default_flow_style=True, indent=2)
-
             if '_result' in config_list[0]:
-                results_file = source_dir / "results.yaml"
-                with open(results_file, 'w') as f:
-                    yaml.dump(
-                        config_list[0]['_result'],
-                        f,
-                        default_flow_style=True,
-                        indent=2)
+                write_results_yaml(config_list[0]['_result'], source_dir)
         else:
             for i, config in enumerate(config_list):
-                output_file = source_dir / f"output_{i+1}.yaml"
-                with open(output_file, 'w') as f:
-                    yaml.dump(config, f, default_flow_style=True, indent=2)
-
                 if '_result' in config:
-                    results_file = source_dir / f"results_{i+1}.yaml"
-                    with open(results_file, 'w') as f:
-                        yaml.dump(
-                            config['_result'],
-                            f,
-                            default_flow_style=True,
-                            indent=2)
+                    write_results_yaml(
+                        config['_result'],
+                        source_dir,
+                        filename=f"results_{i+1}.yaml")
 
     print(f"Created output directory structure: {output_dir}")
     return output_dir
+
+
+def _validate_and_normalize_config(config, config_id):
+    required_fields = ['calc_type']
+    missing_fields = [f for f in required_fields if f not in config]
+    if missing_fields:
+        raise ValueError(f"Configuration {config_id} missing required fields: {missing_fields}")
+
+    calc_type = config.get('calc_type')
+    if calc_type not in ['beam', 'homogeneous', 'interface', 'sandwich']:
+        raise ValueError(
+            f"Configuration {config_id} has invalid calc_type: {calc_type}. Must be 'beam', 'homogeneous', 'interface', or 'sandwich'")
+
+    if calc_type == 'beam':
+        if 'beam_energy' not in config and 'beam_intensities' not in config:
+            raise ValueError(
+                f"Beam calculation {config_id} missing required field: beam_energy or beam_intensities")
+    elif calc_type == 'interface':
+        if 'source_matdef' not in config or 'target_matdef' not in config:
+            raise ValueError(
+                f"Interface calculation {config_id} missing required field: source_matdef or target_matdef")
+    elif calc_type == 'sandwich':
+        required = ['source_matdef', 'source_density', 'target_matdef']
+        missing = [f for f in required if f not in config]
+        if missing:
+            raise ValueError(f"Sandwich calculation {config_id} missing required fields: {missing}")
+
+        has_layers_list = 'intermediate_layers' in config
+        has_single_layer = all(
+            k in config for k in ['intermediate_matdef', 'intermediate_density', 'intermediate_thickness'])
+
+        if not (has_layers_list or has_single_layer):
+            raise ValueError(
+                f"Sandwich calculation {config_id} requires either 'intermediate_layers' (list) "
+                "or 'intermediate_matdef', 'intermediate_density', 'intermediate_thickness' (single layer)")
+
+        if has_single_layer and not has_layers_list:
+            config['intermediate_layers'] = [{
+                'matdef': config.pop('intermediate_matdef'),
+                'density': config.pop('intermediate_density'),
+                'thickness': config.pop('intermediate_thickness'),
+                'include_targets': config.get('include_intermediate_targets', True)
+            }]
+
+        for j, layer in enumerate(config['intermediate_layers']):
+            if 'matdef' not in layer or 'density' not in layer or 'thickness' not in layer:
+                raise ValueError(
+                    f"Sandwich calculation {config_id} layer {j} missing required fields: matdef, density, thickness")
+            if layer['thickness'] <= 0:
+                raise ValueError(
+                    f"Sandwich calculation {config_id} layer {j} thickness must be positive, got {layer['thickness']}")
+            if layer['density'] <= 0:
+                raise ValueError(
+                    f"Sandwich calculation {config_id} layer {j} density must be positive, got {layer['density']}")
+
+
+def _run_one_config(config):
+    try:
+        return Transport.calculate(config), None
+    except Exception as e:
+        return None, str(e)
 
 
 def _cmd_run(config_path, output_dir):
@@ -188,88 +234,36 @@ def _cmd_run(config_path, output_dir):
 
     configs = read_in(config_path)
 
+    valid_indices = []
     for i, config in enumerate(configs):
-        source = config.get('source', f'config_{i+1}')
         config_id = config.get('id', config.get('name', f'config_{i+1}'))
-
-        print(
-            f"\nProcessing configuration {i+1}/{len(configs)}: {config_id}")
-
         try:
-            required_fields = ['calc_type']
-            missing_fields = [
-                field for field in required_fields if field not in config]
-
-            if missing_fields:
-                raise ValueError(
-                    f"Configuration {config_id} missing required fields: {missing_fields}")
-
-            calc_type = config.get('calc_type')
-            if calc_type not in [
-                'beam',
-                'homogeneous',
-                'interface',
-                    'sandwich']:
-                raise ValueError(
-                    f"Configuration {config_id} has invalid calc_type: {calc_type}. Must be 'beam', 'homogeneous', 'interface', or 'sandwich'")
-
-            if calc_type == 'beam':
-                if 'beam_energy' not in config and 'beam_intensities' not in config:
-                    raise ValueError(
-                        f"Beam calculation {config_id} missing required field: beam_energy or beam_intensities")
-            elif calc_type == 'interface':
-                if 'source_matdef' not in config or 'target_matdef' not in config:
-                    raise ValueError(
-                        f"Interface calculation {config_id} missing required field: source_matdef or target_matdef")
-            elif calc_type == 'sandwich':
-                required = [
-                    'source_matdef',
-                    'source_density',
-                    'target_matdef']
-                missing = [f for f in required if f not in config]
-                if missing:
-                    raise ValueError(
-                        f"Sandwich calculation {config_id} missing required fields: {missing}")
-
-                has_layers_list = 'intermediate_layers' in config
-                has_single_layer = all(
-                    k in config for k in [
-                        'intermediate_matdef',
-                        'intermediate_density',
-                        'intermediate_thickness'])
-
-                if not (has_layers_list or has_single_layer):
-                    raise ValueError(
-                        f"Sandwich calculation {config_id} requires either 'intermediate_layers' (list) "
-                        "or 'intermediate_matdef', 'intermediate_density', 'intermediate_thickness' (single layer)")
-
-                if has_single_layer and not has_layers_list:
-                    config['intermediate_layers'] = [{
-                        'matdef': config.pop('intermediate_matdef'),
-                        'density': config.pop('intermediate_density'),
-                        'thickness': config.pop('intermediate_thickness'),
-                        'include_targets': config.get('include_intermediate_targets', True)
-                    }]
-
-                for j, layer in enumerate(config['intermediate_layers']):
-                    if 'matdef' not in layer or 'density' not in layer or 'thickness' not in layer:
-                        raise ValueError(
-                            f"Sandwich calculation {config_id} layer {j} missing required fields: matdef, density, thickness")
-                    if layer['thickness'] <= 0:
-                        raise ValueError(
-                            f"Sandwich calculation {config_id} layer {j} thickness must be positive, got {layer['thickness']}")
-                    if layer['density'] <= 0:
-                        raise ValueError(
-                            f"Sandwich calculation {config_id} layer {j} density must be positive, got {layer['density']}")
-
-            result = Transport.calculate(config)
-            logger.info(f"Completed {config_id}")
-
-            config['_result'] = result
-
+            _validate_and_normalize_config(config, config_id)
+            valid_indices.append(i)
         except Exception as e:
-            print(f"Error processing {config_id}: {e}")
-            continue
+            print(f"Error in config {config_id}: {e}")
+
+    if not valid_indices:
+        print("No valid configurations to run.")
+        read_out(configs, output_dir)
+        return
+
+    valid_configs = [configs[i] for i in valid_indices]
+    print(f"\nRunning {len(valid_configs)} configuration(s)...")
+
+    if len(valid_configs) == 1:
+        pairs = [_run_one_config(valid_configs[0])]
+    else:
+        with ProcessPoolExecutor() as pool:
+            pairs = list(pool.map(_run_one_config, valid_configs))
+
+    for i, (result, error) in zip(valid_indices, pairs):
+        config_id = configs[i].get('id', configs[i].get('name', f'config_{i+1}'))
+        if error:
+            print(f"Error processing {config_id}: {error}")
+        else:
+            configs[i]['_result'] = result
+            logger.info(f"Completed {config_id}")
 
     output_dir_path = read_out(configs, output_dir)
     print(f"Output saved to: {output_dir_path}")

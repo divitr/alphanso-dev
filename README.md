@@ -143,7 +143,7 @@ print(f"Neutron yield: {results['an_yield']:.3e} n/alpha")
 `Transport.calculate()` accepts optional keys in the config dict:
 
 - `name` (str): Label for identification in CLI output
-- `output_dir` (str): Directory to save output files. When specified, saves `output.yaml` (full config + results) and `results.yaml` (results only).
+- `output_dir` (str): Directory to save `results.yaml`.
 - `save_data_files` (bool, default: `True`): Whether to save output files when `output_dir` is specified. Set to `False` to skip file saving.
 
 ## Running Tests
@@ -313,10 +313,7 @@ Mass fractions should sum to 1.0 for single-phase materials, but can exceed 1.0 
 
 ## Output Files
 
-When using the CLI, results are saved to `alphanso_output/<config_name>/`:
-
-- **`output.yaml`**: Complete input configuration and full results (for reproducibility)
-- **`results.yaml`**: Clean results-only output (for easy parsing)
+When using the CLI, results are saved to `alphanso_output/<config_name>/` as `results.yaml`.
 
 ## Custom Data Sources
 
@@ -340,9 +337,11 @@ If you use ALPHANSO in your research, please cite:
 @article{rawal2026alphanso,
   title     = {{ALPHANSO}: Open-Source Modeling of ($\alpha$,n) Neutron Source Terms},
   author    = {Rawal, Divit and Nelson, Anthony J. and Zywiec, William and Siefman, Daniel},
-  journal   = {Nuclear Instruments and Methods in Physics Research Section A},
   year      = {2026},
-  note      = {Preprint}
+  eprint    = {2603.17719},
+  archivePrefix = {arXiv},
+  primaryClass  = {physics.comp-ph},
+  note      = {Submitted to Nuclear Instruments and Methods in Physics Research Section A}
 }
 ```
 
